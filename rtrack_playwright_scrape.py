@@ -6,9 +6,10 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 def main():
+    # 目标网址
     url = "https://rtrack.live/datasets"
-    keywords = ["concurrent", "graph", "chart", "api/graph"]
-    printed = set()
+    
+    # 连接数据库
     conn = sqlite3.connect("roblox_data.db")
     cur = conn.cursor()
     cur.execute(
@@ -21,84 +22,112 @@ def main():
         """
     )
 
-    def extract_points(payload):
+    # 简化的数据提取逻辑
+    def extract_and_save(data):
         pts = []
-        def add(ts, val):
-            if ts is None or val is None:
-                return
-            try:
-                v = int(float(val))
-            except Exception:
-                return
-            ts_str = str(ts)
-            pts.append((ts_str, v))
-        def parse_item(item):
-            if isinstance(item, dict):
-                ts = item.get("AsOfHour") or item.get("timestamp") or item.get("time") or item.get("x")
-                val = item.get("PlatformConcurrent") or item.get("user_count") or item.get("value") or item.get("y")
-                add(ts, val)
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                add(item[0], item[1])
-        if isinstance(payload, dict):
-            for k in ("Response", "data", "points", "series", "values"):
-                v = payload.get(k)
-                if isinstance(v, list) and v:
-                    for it in v:
-                        parse_item(it)
-            parse_item(payload)
-        elif isinstance(payload, list):
-            for it in payload:
-                parse_item(it)
-        return pts
+        # 尝试寻找常见的图表数据结构
+        # 针对 RTrack 可能的结构 1: { "data": { "points": [...] } }
+        # 针对 RTrack 可能的结构 2: [ [time, value], ... ]
+        
+        # 递归查找列表
+        def find_lists(obj):
+            if isinstance(obj, list):
+                # 简单的启发式判断：如果列表里的元素看起来像坐标点 [time, value]
+                if len(obj) > 10 and isinstance(obj[0], (list, dict)): 
+                    return [obj]
+                return []
+            elif isinstance(obj, dict):
+                results = []
+                for k, v in obj.items():
+                    results.extend(find_lists(v))
+                return results
+            return []
+
+        potential_lists = find_lists(data)
+        
+        count = 0
+        now = datetime.utcnow().isoformat()
+
+        for lst in potential_lists:
+            for item in lst:
+                ts = None
+                val = None
+                
+                # 尝试解析 [timestamp, value] 格式
+                if isinstance(item, list) and len(item) >= 2:
+                    ts = item[0]
+                    val = item[1]
+                # 尝试解析字典格式 { "x": ..., "y": ... } 或 { "time": ..., "value": ... }
+                elif isinstance(item, dict):
+                    ts = item.get("x") or item.get("time") or item.get("AsOfHour") or item.get("timestamp")
+                    val = item.get("y") or item.get("value") or item.get("PlatformConcurrent") or item.get("user_count")
+
+                # 只有当时间和数值都存在，且数值看起来像是一个大整数时才保存
+                if ts and val:
+                    try:
+                        val_int = int(float(val))
+                        # 过滤掉显然不对的小数字（并发人数通常很大）
+                        if val_int > 1000: 
+                            cur.execute(
+                                "INSERT OR IGNORE INTO concurrent_users(timestamp, user_count, fetched_at) VALUES (?, ?, ?)",
+                                (str(ts), val_int, now),
+                            )
+                            count += 1
+                    except:
+                        pass
+        return count
 
     def on_response(response):
         try:
-            u = response.url
-            ul = u.lower()
-            ct = (response.headers.get("content-type") or "").lower()
-            if any(k in ul for k in keywords):
-                if "json" in ct:
-                    try:
-                        data = response.json()
-                    except Exception:
-                        try:
-                            data = json.loads(response.text())
-                        except Exception:
-                            data = None
-                else:
-                    try:
-                        data = json.loads(response.text())
-                    except Exception:
-                        data = None
-                if data is not None and u not in printed:
-                    printed.add(u)
-                    print("==== JSON captured from:", u)
-                    print(json.dumps(data, ensure_ascii=False, indent=2))
-                    pts = extract_points(data)
-                    if pts:
-                        now = datetime.utcnow().isoformat()
-                        for ts, val in pts:
-                            cur.execute(
-                                "INSERT OR IGNORE INTO concurrent_users(timestamp, user_count, fetched_at) VALUES (?, ?, ?)",
-                                (ts, val, now),
-                            )
-                        conn.commit()
-        except Exception:
-            pass
+            # 只过滤掉显然是图片、CSS、JS 的资源
+            resource_type = response.request.resource_type
+            if resource_type in ["image", "stylesheet", "font"]:
+                return
+
+            # 打印所有 JSON 类型的响应，用于调试
+            if "json" in response.headers.get("content-type", "").lower():
+                print(f"🔍 发现 JSON: {response.url} [Status: {response.status}]")
+                
+                try:
+                    data = response.json()
+                    saved_count = extract_and_save(data)
+                    if saved_count > 0:
+                        print(f"✅ 成功提取并保存了 {saved_count} 条数据！")
+                except:
+                    pass
+        except Exception as e:
+            print(f"Error processing response: {e}")
 
     with sync_playwright() as p:
+        # 添加 User-Agent 伪装，防止被识别为机器人
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = context.new_page()
+        
+        print("🚀 开始访问页面...")
         page.on("response", on_response)
-        page.goto(url, wait_until="networkidle")
-        page.wait_for_timeout(10000)
-        csv_path = os.path.join(os.getcwd(), "concurrent_users.csv")
+        
+        try:
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            print("📄 页面加载完成，等待数据包...")
+            page.wait_for_timeout(15000) # 多等一会儿
+        except Exception as e:
+            print(f"⚠️ 页面加载超时或出错: {e}")
+
+        # 导出 CSV
+        csv_path = "concurrent_users.csv"
+        saved_rows = 0
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["timestamp", "user_count", "fetched_at"])
             for row in cur.execute("SELECT timestamp, user_count, fetched_at FROM concurrent_users ORDER BY timestamp"):
                 w.writerow(row)
+                saved_rows += 1
+        
+        print(f"📊 最终 CSV 文件包含 {saved_rows} 行数据。")
+        
         browser.close()
         conn.close()
 
